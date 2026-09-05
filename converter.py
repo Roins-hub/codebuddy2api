@@ -320,6 +320,13 @@ async def chat_completions(request: Request,
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
+    # 腾讯后端不支持 developer role，遇到会触发安全策略拦截（11128），统一映射为 system
+    if "messages" in body and isinstance(body["messages"], list):
+        body["messages"] = [
+            dict(m, role="system") if isinstance(m, dict) and m.get("role") == "developer" else m
+            for m in body["messages"]
+        ]
+
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
     if CONFIG.get("desensitize"):
