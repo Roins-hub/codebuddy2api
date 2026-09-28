@@ -241,8 +241,15 @@ $("base-url").textContent = location.origin + "/v1"; $("anthropic-url").textCont
 $("copy-base").addEventListener("click", () => copy(location.origin + "/v1")); $("copy-anthropic").addEventListener("click", () => copy(location.origin));
 $("host-label").textContent = location.host;
 $("test-form").addEventListener("submit", async e => {
-  e.preventDefault(); busy = true; $("test-submit").disabled = true; $("test-submit").textContent = "正在调用…"; $("test-status").className = "pill amber"; $("test-status").textContent = "请求中"; $("test-output").textContent = "正在等待上游响应，最长约 90 秒…"; $("test-meta").textContent = "";
-  try { const r = await api("test", {method:"POST",body:{model:$("model").value,prompt:$("test-prompt").value}}); $("test-status").className = "pill " + (r.ok ? "green" : "red"); $("test-status").textContent = r.ok ? "连接成功" : "调用失败"; $("test-output").textContent = r.ok ? r.answer : r.error; $("test-meta").textContent = `${r.seconds}s${r.status ? " · HTTP " + r.status : ""}${r.usage?.total_tokens !== undefined ? " · " + r.usage.total_tokens + " tokens" : ""}`; }
+  e.preventDefault(); busy = true; $("test-submit").disabled = true; $("test-submit").textContent = "正在调用…"; $("test-status").className = "pill amber"; $("test-status").textContent = "请求中"; $("test-output").textContent = "正在等待上游生成完整回复，最长约 300 秒。流式实时输出可通过 API 客户端使用。"; $("test-meta").textContent = "";
+  try {
+    const r = await api("test", {method:"POST",body:{model:$("model").value,prompt:$("test-prompt").value,max_tokens:Number($("test-budget").value),reasoning_effort:$("test-effort").value}});
+    $("test-status").className = "pill " + (r.truncated ? "amber" : r.ok ? "green" : "red");
+    $("test-status").textContent = r.truncated ? "预算耗尽" : r.ok ? "连接成功" : "调用失败";
+    $("test-output").textContent = r.ok ? r.answer + (r.warning ? "\n\n——\n" + r.warning : "") : r.error;
+    const u=r.usage, reasoning=u?.completion_tokens_details?.reasoning_tokens ?? u?.completion_thinking_tokens;
+    $("test-meta").textContent = `${r.seconds}s${r.status ? " · HTTP " + r.status : ""}${u?.total_tokens !== undefined ? " · 总计 " + u.total_tokens + " tokens" : ""}${u?.completion_tokens !== undefined ? " · 生成 " + u.completion_tokens : ""}${reasoning !== undefined ? " · 思考 " + reasoning : ""}${r.finish_reason ? " · " + r.finish_reason : ""}`;
+  }
   catch (err) { $("test-status").className = "pill red"; $("test-status").textContent = "请求失败"; $("test-output").textContent = err.message; }
   finally { busy = false; $("test-submit").textContent = "发送测试 ↗"; await refresh().catch(() => {}); }
 });

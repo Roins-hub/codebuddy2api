@@ -425,6 +425,111 @@ PASSTHROUGH_BODY_KEYS = {
 }
 
 # ---------------------------------------------------------------------------
+# 思考内容（reasoning_content）处理（/v1/chat/completions）
+#
+# GLM-5.3、kimi-k3 这类推理模型会先输出很长的 reasoning_content，正文迟迟不出。
+# 只渲染 delta.content 的聊天前端在这段时间里看不到任何字，容易被当成卡死。
+#
+#   native ：保持后端原样的 reasoning_content 字段（默认；Codex / Cherry 等原生客户端）
+#   tag    ：把思考内容包在 <think></think> 里当作正文下发（通用前端可见）
+#   off    ：丢弃思考内容，只下发正文
+#
+# 单次请求可用请求头 X-Think-Mode 覆盖环境变量 WB_THINK_MODE。
+# WB_THINK_TIMEOUT：思考预算（秒），超过仍无正文就中止上游并给出提示；默认 0 不限制。
+# ---------------------------------------------------------------------------
+
+THINK_MODES = ("native", "tag", "off")
+THINK_OPEN = "<think>\n"
+THINK_CLOSE = "\n</think>\n\n"
+
+
+def _think_mode(request: "Request | None" = None) -> str:
+    value = ""
+    if request is not None:
+        value = request.headers.get("x-think-mode") or ""
+    if not value:
+        value = os.environ.get("WB_THINK_MODE", "")
+    value = value.strip().lower()
+    return value if value in THINK_MODES else "native"
+
+
+def _think_timeout() -> float:
+    try:
+        return float(os.environ.get("WB_THINK_TIMEOUT", "0"))
+    except ValueError:
+        return 0.0
+
+
+def _think_abort_note(think_timeout: float) -> str:
+    return (
+        f"\n\n> ⚠️ 模型思考已超过 {int(think_timeout)} 秒仍未开始输出正文，"
+        f"本次请求已由网关中止。\n"
+        f"> 建议：降低 reasoning_effort、换用非推理模型（如 deepseek-v4-flash）重试，或把任务拆小。"
+    )
+
+
+def _sse(obj: dict) -> bytes:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode()
+
+
+def _text_chunk(template: dict, text: str, finish: str | None = None) -> dict:
+    """按上游 chunk 的 id / model 造一个只含文本的 chat.completion.chunk。"""
+    return {
+        "id": template.get("id") or ("chatcmpl-" + os.urandom(12).hex()),
+        "object": "chat.completion.chunk",
+        "created": template.get("created") or int(time.time()),
+        "model": template.get("model") or "unknown",
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": finish}],
+    }
+
+
+class _ThinkRewriter:
+    """按 think_mode 改写上游 chat.completion.chunk（tag / off 模式使用）。"""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.think_open = False
+
+    def transform(self, obj: dict) -> dict | None:
+        """返回改写后的 chunk；None 表示这个 chunk 无需转发。"""
+        choices = obj.get("choices") or []
+        if not choices:
+            return obj  # 仅含 usage 等的收尾 chunk
+        keep = False
+        for ch in choices:
+            delta = ch.get("delta") or {}
+            reasoning = delta.pop("reasoning_content", None) or ""
+            content = delta.get("content") or ""
+            if self.mode == "tag":
+                text = ""
+                if content:
+                    if self.think_open:
+                        self.think_open = False
+                        text = THINK_CLOSE
+                    text += content
+                elif reasoning:
+                    if not self.think_open:
+                        self.think_open = True
+                        text = THINK_OPEN
+                    text += reasoning
+                elif delta.get("tool_calls") and self.think_open:
+                    self.think_open = False
+                    text = THINK_CLOSE
+                if text:
+                    delta["content"] = text
+            if delta.get("content") or delta.get("tool_calls") or ch.get("finish_reason") or delta.get("role"):
+                keep = True
+        return obj if keep else None
+
+    def close(self, template: dict) -> bytes:
+        """若 <think> 仍未闭合，返回闭合它的 chunk。"""
+        if not self.think_open:
+            return b""
+        self.think_open = False
+        return _sse(_text_chunk(template, THINK_CLOSE))
+
+
+# ---------------------------------------------------------------------------
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 
@@ -677,11 +782,16 @@ async def chat_completions(
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
+    think_mode = _think_mode(request)
+    think_timeout = _think_timeout()
 
     if client_wants_stream:
         return StreamingResponse(
             _with_heartbeat(
-                _stream_upstream(url, headers, body, model_name, t0, rid), SSE_KEEPALIVE
+                _stream_upstream(
+                    url, headers, body, model_name, t0, rid, think_mode, think_timeout
+                ),
+                SSE_KEEPALIVE,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -701,7 +811,7 @@ async def chat_completions(
                         status_code=r.status_code,
                         detail=_safe_err_raw(raw, r.status_code),
                     )
-                collected = await _collect_stream(r)
+                collected = await _collect_stream(r, think_mode, think_timeout, t0)
     except HTTPException:
         raise
     except httpx.HTTPError as e:
@@ -755,12 +865,20 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
     )
 
 
-async def _collect_stream(response: httpx.Response) -> dict:
+async def _collect_stream(
+    response: httpx.Response,
+    think_mode: str = "native",
+    think_timeout: float = 0.0,
+    t0: float = 0.0,
+) -> dict:
     """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
-    合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    合并所有 chunk 的 delta（content / tool_calls / reasoning_content），
+    并取 usage / finish_reason；思考内容按 think_mode 放进 reasoning_content 或 <think>。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    aborted = False
     # tool_calls: index -> {id, name, arguments(分片拼接)}
     tool_calls: dict[int, dict] = {}
     model: str | None = None
@@ -787,6 +905,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(
@@ -800,6 +920,17 @@ async def _collect_stream(response: httpx.Response) -> dict:
                 if fn.get("arguments"):
                     slot["arguments"] += fn["arguments"]
 
+        # 思考预算：迟迟不出正文就主动收尾，别让客户端一直干等
+        if (
+            think_timeout > 0
+            and not content_parts
+            and not tool_calls
+            and t0
+            and time.time() - t0 > think_timeout
+        ):
+            aborted = True
+            break
+
     tcs = None
     if tool_calls:
         tcs = [
@@ -812,7 +943,17 @@ async def _collect_stream(response: httpx.Response) -> dict:
         ]
         finish_reason = finish_reason or "tool_calls"
 
-    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    reasoning = "".join(reasoning_parts)
+    text = "".join(content_parts)
+    if think_mode == "tag" and reasoning:
+        text = THINK_OPEN + reasoning + THINK_CLOSE + text
+    if aborted:
+        finish_reason = "length"
+        text += _think_abort_note(think_timeout)
+
+    message = {"role": "assistant", "content": text or None}
+    if think_mode == "native" and reasoning:
+        message["reasoning_content"] = reasoning
     if tcs:
         message["tool_calls"] = tcs
     return {
@@ -848,11 +989,14 @@ async def _stream_upstream(
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
+    think_mode: str = "native",
+    think_timeout: float = 0.0,
 ):
-    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
+    """把后端 SSE 转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
 
-    同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
-    完整原始 SSE 累积后落盘到日志（调试用）。
+    native 模式原样转发字节；tag / off 模式按 think_mode 改写 reasoning_content。
+    同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志；超过思考预算
+    仍无正文则中止上游并给出明确结束。完整原始 SSE 累积后落盘到日志（调试用）。
     """
     finish_reason = None
     tool_names: list[str] = []
@@ -861,10 +1005,17 @@ async def _stream_upstream(
     buf = b""
     raw_parts: list[bytes] = []  # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
+    rewriter = _ThinkRewriter(think_mode) if think_mode != "native" else None
+    think_chars = 0
+    body_chars = 0
+    last_obj: dict = {}
+    saw_done = False
+    aborted = False
 
-    def _feed(chunk: bytes):
-        nonlocal finish_reason, saw_filter, buf
-        # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
+    def _feed(chunk: bytes) -> list[bytes]:
+        """行缓冲解析：统计日志信息；tag / off 模式下返回改写后要转发的字节。"""
+        nonlocal finish_reason, saw_filter, buf, think_chars, body_chars, last_obj, saw_done
+        out: list[bytes] = []
         buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
@@ -873,34 +1024,56 @@ async def _stream_upstream(
                 continue
             data = line[5:].strip()
             if data == b"[DONE]":
+                saw_done = True
+                if rewriter is not None:
+                    out.append(rewriter.close(last_obj))
+                    out.append(b"data: [DONE]\n\n")
                 continue
             try:
                 obj = json.loads(data)
             except Exception:
+                if rewriter is not None:
+                    out.append(line + b"\n\n")
                 continue
+            if not isinstance(obj, dict):
+                continue
+            last_obj = obj
             if obj.get("usage"):
                 usage.update(obj["usage"])
             for ch in obj.get("choices") or []:
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
-                for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                delta = ch.get("delta") or {}
+                think_chars += len(delta.get("reasoning_content") or "")
+                body_chars += len(delta.get("content") or "")
+                for tc in delta.get("tool_calls") or []:
                     nm = (tc.get("function") or {}).get("name")
                     if nm:
                         tool_names.append(nm)
+                if delta.get("tool_calls"):
+                    body_chars += 1  # 工具调用也算已开始输出
             # 内容审核拦截常以 content-filter 或特殊中文文案返回
-            try:
-                text_repr = data.decode("utf-8", "replace")
-            except Exception:
-                text_repr = ""
+            text_repr = data.decode("utf-8", "replace")
             if (
                 "content-filter" in text_repr
                 or "敏感" in text_repr
                 or "审核" in text_repr
             ):
                 saw_filter = True
+            if rewriter is not None:
+                rewritten = rewriter.transform(obj)
+                if rewritten is not None:
+                    out.append(_sse(rewritten))
+        return out
+
+    def _over_budget() -> bool:
+        return bool(
+            think_timeout > 0 and not body_chars and t0 and time.time() - t0 > think_timeout
+        )
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
+        timeout = httpx.Timeout(connect=20, read=300, write=30, pool=20)
+        async with httpx.AsyncClient(timeout=timeout) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -911,19 +1084,53 @@ async def _stream_upstream(
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
-                    if chunk:
-                        raw_parts.append(chunk)
-                        _feed(chunk)
+                    if not chunk:
+                        continue
+                    raw_parts.append(chunk)
+                    out = _feed(chunk)
+                    if rewriter is None:
                         yield chunk
+                    else:
+                        for piece in out:
+                            if piece:
+                                yield piece
+                    if _over_budget():
+                        aborted = True
+                        break
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+        if rewriter is not None:
+            closing = rewriter.close(last_obj)  # 别把没闭合的 <think> 留给客户端
+            if closing:
+                yield closing
         yield _err_event(str(e).encode(), 502)
+        if rewriter is not None:
+            yield b"data: [DONE]\n\n"
+        return
+
+    if aborted:
+        finish_reason = "length"
+        if rewriter is not None:
+            closing = rewriter.close(last_obj)
+            if closing:
+                yield closing
+        yield _sse(_text_chunk(last_obj, _think_abort_note(think_timeout), finish="length"))
+        yield b"data: [DONE]\n\n"
+        _log(
+            f"{prefix}⏱ 思考预算耗尽 | {model_name} | {think_timeout:.0f}s | 思考 {think_chars} 字 / 正文 0 字，已中止上游"
+        )
+    elif rewriter is not None and not saw_done:
+        closing = rewriter.close(last_obj)
+        if closing:
+            yield closing
+        yield b"data: [DONE]\n\n"
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
     tag = " ⚠️内容审核拦截" if (saw_filter or finish_reason == "content-filter") else ""
     _log(
         f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
+        + f" | think={think_chars}字 body={body_chars}字 mode={think_mode}"
         + (f" | tool_calls={tool_names}" if tool_names else "")
         + f" | tokens={usage.get('total_tokens', '?')}"
     )

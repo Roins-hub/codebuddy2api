@@ -76,6 +76,11 @@ def responses_request_to_chat(body: dict) -> dict:
         if key in body:
             chat[key] = body[key]
 
+    # 原生 Responses 客户端用 reasoning.effort，而不是 reasoning_effort
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        chat["reasoning_effort"] = reasoning["effort"]
+
     # max_output_tokens → max_tokens
     if "max_output_tokens" in body:
         chat["max_tokens"] = body["max_output_tokens"]
@@ -314,6 +319,14 @@ class ResponsesStreamConverter:
             return ""
         return self._process_chunk(chunk)
 
+    def start(self) -> str:
+        """发出 created + in_progress（只发一次；首个上游 chunk 到达时调用）。"""
+        if self._emitted_created:
+            return ""
+        self._emitted_created = True
+        resp = self._response_obj("in_progress")
+        return self._evt("response.created", {"response": resp}) + self._evt("response.in_progress", {"response": resp})
+
     def finish(self) -> str:
         """流结束后，发出收尾事件（done + completed）。"""
         if self._finished or self._error:
@@ -376,12 +389,9 @@ class ResponsesStreamConverter:
         if chunk.get("model"):
             self.model = chunk["model"]
 
-        # 首次 → 发 created + in_progress
+        # 首次 → 发 created + in_progress（若 start() 已提前发过则跳过）
         if not self._emitted_created:
-            resp = self._response_obj("in_progress")
-            events.append(self._evt("response.created", {"response": resp}))
-            events.append(self._evt("response.in_progress", {"response": resp}))
-            self._emitted_created = True
+            events.append(self.start())
 
         # usage
         if chunk.get("usage"):
@@ -524,7 +534,7 @@ class ResponsesStreamConverter:
                 "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
                 "input_tokens_details": {"cached_tokens": _cached_tokens(u)},
                 "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)},
                 "total_tokens": u.get("total_tokens", u.get("prompt_tokens", u.get("input_tokens", 0)) + u.get("completion_tokens", u.get("output_tokens", 0))),
             }
 

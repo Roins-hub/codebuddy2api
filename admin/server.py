@@ -515,6 +515,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         model = body.get("model", "deepseek-v4-flash")
         prompt = body.get("prompt", "请只回复：连接成功")
+        budget = body.get("max_tokens", 8192)
+        effort = body.get("reasoning_effort", "default")
+        if type(budget) is not int or not 128 <= budget <= 32000:
+            raise HTTPException(400, "生成预算需为 128–32000 的整数")
+        if effort not in ("default", "low", "high", "max"):
+            raise HTTPException(400, "推理强度无效")
         if not isinstance(model, str) or model not in converter.get_available_models():
             raise HTTPException(400, "请选择列表中的模型")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 2000:
@@ -530,15 +536,24 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
             try:
+                request_body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": budget, "stream": False}
+                if effort != "default":
+                    request_body["reasoning_effort"] = effort
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
-                    result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
+                    result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json=request_body), timeout=300)
                 data = result.json()
                 answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") if result.status_code == 200 else ""
                 output = {"ok": result.status_code == 200 and bool(answer), "status": result.status_code, "answer": answer, "seconds": round(time.monotonic() - started, 2), "usage": data.get("usage") if result.status_code == 200 else None}
+                output["finish_reason"] = data.get("choices", [{}])[0].get("finish_reason")
+                output["truncated"] = output["finish_reason"] == "length"
+                if output["truncated"] and answer:
+                    output["warning"] = "已返回部分内容，但生成预算耗尽，输出未完整结束。可提高生成预算或降低推理强度后重试。"
                 if not output["ok"]:
                     output["error"] = "上游未返回有效回复，请检查登录凭据、账号额度或模型权限。"
                     if result.status_code == 200 and data.get("choices", [{}])[0].get("finish_reason") == "length":
-                        output["error"] = "已连接上游，但生成预算耗尽，未获得正文。请在客户端提高 max_tokens 后重试。"
+                        output["error"] = "已连接上游，但生成预算耗尽，未获得正文。请在左侧提高生成预算或降低推理强度后重试。"
+            except asyncio.TimeoutError:
+                output = {"ok": False, "error": "测试等待超过 300 秒。请降低推理强度、简化任务，或使用支持流式输出的 API 客户端。", "seconds": round(time.monotonic() - started, 2)}
             except (Exception, asyncio.TimeoutError):
                 output = {"ok": False, "error": "调用失败或超时，请检查凭据是否有效，稍后重试。", "seconds": round(time.monotonic() - started, 2)}
             finally:
