@@ -233,6 +233,8 @@ python3 -m core.converter --port 9000
 | `--no-compact` | 关 | 配合 `--desensitize` 使用，保留更完整的原始 system prompt |
 | `--skip-check` | 否 | 跳过启动预检 |
 
+环境变量 `WB_HEARTBEAT_SECONDS`（默认 `15`，`<=0` 关闭）：流式响应超过这么多秒没有向客户端输出时，发送一次心跳（Chat / Responses 为 SSE 注释 `: keep-alive`，Anthropic 为 `ping` 事件）。kimi-k3、glm-5.3 等长思考模型可能思考十几分钟才输出正文，而 `/v1/messages`、`/v1/responses` 不转发思考内容，没有心跳时容易被客户端或 Nginx 等网关按空闲超时断开。经 Nginx 反代时还应把 `proxy_read_timeout` 调大（如 `1800s`）。
+
 ### curl 示例
 
 ```bash

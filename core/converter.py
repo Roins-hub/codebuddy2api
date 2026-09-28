@@ -22,6 +22,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -457,6 +458,64 @@ def _log(msg: str):
         pass  # 日志失败不应影响主流程
 
 
+# ---------------------------------------------------------------------------
+# 流式心跳
+# ---------------------------------------------------------------------------
+# 长思考模型（kimi-k3 / glm-5.3 等）可能思考十几分钟才输出正文。Anthropic / Responses
+# 转换会丢弃思考内容，这期间客户端收不到任何字节，容易被客户端或 Nginx 等网关按空闲
+# 超时断开。下游超过 WB_HEARTBEAT_SECONDS 秒（默认 15，<=0 关闭）没有输出时插入心跳。
+
+SSE_KEEPALIVE = b": keep-alive\n\n"  # SSE 注释行，按规范会被客户端忽略
+ANTHROPIC_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+
+
+def _heartbeat_seconds() -> float:
+    try:
+        return float(os.environ.get("WB_HEARTBEAT_SECONDS", "15"))
+    except ValueError:
+        return 15.0
+
+
+async def _with_heartbeat(stream, beat: bytes, interval: float | None = None):
+    """包装异步字节流：下游静默超过 interval 秒时插入心跳。
+
+    等待上游时不取消正在进行的 __anext__，心跳只是在等待间隙插入。
+    """
+    interval = _heartbeat_seconds() if interval is None else interval
+    if interval <= 0:
+        async for chunk in stream:
+            yield chunk
+        return
+
+    it = stream.__aiter__()
+    pending: asyncio.Future | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(it.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield beat
+                continue
+            task, pending = pending, None
+            try:
+                chunk = task.result()
+            except StopAsyncIteration:
+                return
+            yield chunk
+    finally:
+        # 客户端断开时：先结束挂起的读取，再关闭上游生成器，释放后端连接
+        if pending is not None:
+            pending.cancel()
+            try:
+                await pending
+            except BaseException:
+                pass
+        aclose = getattr(it, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 def _truncate(s: str, n: int = 80) -> str:
     s = str(s).replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
@@ -621,7 +680,9 @@ async def chat_completions(
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid),
+            _with_heartbeat(
+                _stream_upstream(url, headers, body, model_name, t0, rid), SSE_KEEPALIVE
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1043,7 +1104,10 @@ async def create_response(
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_responses(url, headers, chat_body, model_name, t0, rid),
+            _with_heartbeat(
+                _stream_responses(url, headers, chat_body, model_name, t0, rid),
+                SSE_KEEPALIVE,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1223,7 +1287,10 @@ async def create_message(
     # 如果用户请求流式响应，直接返回流式
     if user_stream:
         return StreamingResponse(
-            _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+            _with_heartbeat(
+                _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+                ANTHROPIC_PING,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1250,7 +1317,8 @@ async def _collect_anthropic_nonstream(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as c:
+        # 长思考模型可能长时间只输出思考片段，读超时与其他路径保持一致
+        async with httpx.AsyncClient(timeout=300.0) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
